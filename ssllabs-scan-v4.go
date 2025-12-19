@@ -21,8 +21,10 @@
 package main
 
 import (
+	"ScannerTruora/models"
 	"bufio"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -1052,6 +1054,87 @@ func validateHostname(hostname string) bool {
 	} else {
 		return true
 	}
+}
+
+func InitDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, err
+	}
+
+	schema := `
+	CREATE TABLE IF NOT EXISTS scans (
+		id TEXT PRIMARY KEY,
+		created_at DATETIME,
+		first_test DATETIME,
+		last_test DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS results (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		scan_id TEXT,
+		host TEXT,
+		json TEXT,
+		created_at DATETIME
+	);`
+
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+
+	if logLevel >= LOG_INFO {
+		log.Printf("[INFO] Database initialized")
+	}
+
+	return db, nil
+}
+
+func CreateScan(db *sql.DB, scan *models.Scan) error {
+	_, err := db.Exec(`
+		INSERT OR IGNORE INTO scans 
+		(id, created_at, first_test, last_test)
+		VALUES (?, ?, ?, ?)
+	`,
+		scan.Id,
+		scan.CreatedAt,
+		scan.FirstTest,
+		scan.LastTest,
+	)
+
+	return err
+}
+
+func SaveResult(db *sql.DB, result *models.ScanResult) error {
+	_, err := db.Exec(`
+		INSERT INTO results
+		(scan_id, host, json, created_at)
+		VALUES (?, ?, ?, ?)
+	`,
+		result.ScanID,
+		result.URL,
+		result.Result,
+		result.CreatedAt,
+	)
+
+	return err
+}
+
+func HostExists(db *sql.DB, result *models.ScanResult) bool {
+	row := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM results
+		WHERE scan_id = ? AND host = ?
+	`,
+		result.ScanID,
+		result.URL,
+	)
+
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return false
+	}
+
+	return count > 0
 }
 
 func main() {
