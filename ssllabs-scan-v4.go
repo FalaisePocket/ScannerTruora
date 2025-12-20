@@ -1137,6 +1137,303 @@ func HostExists(db *sql.DB, result *models.ScanResult) bool {
 	return count > 0
 }
 
+func SaveScanResult(db *sql.DB, scan *models.Scan, result *models.ScanResult) error {
+	// Asegurar scan
+	if err := CreateScan(db, scan); err != nil {
+		return err
+	}
+
+	// Evitar duplicados
+	if HostExists(db, result) {
+		if logLevel >= LOG_DEBUG {
+			log.Printf("[DEBUG] Resultado duplicado (%s → %s)", result.ScanID, result.URL)
+		}
+		return nil
+	}
+
+	// Insert result
+	_, err := db.Exec(`
+		INSERT INTO results
+		(scan_id, host, json, created_at)
+		VALUES (?, ?, ?, ?)
+	`,
+		result.ScanID,
+		result.URL,
+		result.Result,
+		result.CreatedAt,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Actualizar First / Last test
+	_, _ = db.Exec(`
+		UPDATE scans
+		SET 
+			first_test = COALESCE(first_test, ?),
+			last_test = ?
+		WHERE id = ?
+	`,
+		result.CreatedAt,
+		result.CreatedAt,
+		scan.Id,
+	)
+
+	return nil
+}
+
+func ClearDatabase(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec("DELETE FROM results"); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	if _, err = tx.Exec("DELETE FROM scans"); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func DeleteResultsByScan(db *sql.DB, scanID string) error {
+	_, err := db.Exec(
+		"DELETE FROM results WHERE scan_id = ?",
+		scanID,
+	)
+
+	if err != nil && logLevel >= LOG_ERROR {
+		log.Printf("[ERROR] DeleteResultsByScan failed (%s): %v", scanID, err)
+	}
+
+	return err
+}
+
+func ListScans(db *sql.DB) ([]models.ScanSummary, error) {
+	rows, err := db.Query(`
+		SELECT 
+			id,
+			created_at,
+			COUNT(r.id),
+			MIN(r.created_at),
+			MAX(r.created_at)
+		FROM scans s
+		LEFT JOIN results r ON r.scan_id = s.id
+		GROUP BY s.id, s.created_at
+		ORDER BY s.created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var scans []models.ScanSummary
+
+	for rows.Next() {
+		var s models.ScanSummary
+		if err := rows.Scan(
+			&s.Id,
+			&s.CreatedAt,
+			&s.ResultCount,
+			&s.FirstTest,
+			&s.LastTest,
+		); err != nil {
+			return nil, err
+		}
+		scans = append(scans, s)
+	}
+
+	return scans, rows.Err()
+}
+
+func QueryScanResults(db *sql.DB, opts models.ScanResultQueryOptions) ([]models.ScanResult, error) {
+	query := `
+		SELECT id, scan_id, host, json, created_at
+		FROM results
+	`
+
+	var conditions []string
+	var args []any
+
+	if opts.ScanID != nil {
+		conditions = append(conditions, "scan_id = ?")
+		args = append(args, *opts.ScanID)
+	}
+
+	if opts.Host != nil {
+		conditions = append(conditions, "host LIKE ?")
+		args = append(args, "%"+*opts.Host+"%")
+	}
+
+	if opts.FromDate != nil {
+		conditions = append(conditions, "created_at >= ?")
+		args = append(args, *opts.FromDate)
+	}
+
+	if opts.ToDate != nil {
+		conditions = append(conditions, "created_at <= ?")
+		args = append(args, *opts.ToDate)
+	}
+
+	if opts.Grade != nil {
+		conditions = append(conditions, "json LIKE ?")
+		args = append(args, `%\"grade\":\"`+*opts.Grade+`\"%`)
+	}
+
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	query += " ORDER BY created_at DESC"
+
+	if opts.Limit != nil {
+		query += " LIMIT ?"
+		args = append(args, *opts.Limit)
+	}
+
+	if opts.Offset != nil {
+		query += " OFFSET ?"
+		args = append(args, *opts.Offset)
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []models.ScanResult
+
+	for rows.Next() {
+		var r models.ScanResult
+		if err := rows.Scan(
+			&r.Id,
+			&r.ScanID,
+			&r.URL,
+			&r.Result,
+			&r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+
+	return results, rows.Err()
+}
+
+func StartNewscan(db *sql.DB, scanID string, filename string) ([]models.ScanResult, error) {
+	lines, err := readLines(&filename)
+	if err != nil {
+		return nil, err
+	}
+
+	scan := &models.Scan{
+		Id:        scanID,
+		CreatedAt: time.Now(),
+	}
+
+	if err := CreateScan(db, scan); err != nil {
+		return nil, err
+	}
+
+	var results []models.ScanResult
+
+	for _, endpoint := range lines {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			continue
+		}
+
+		if !validateURL(endpoint) {
+			if logLevel >= LOG_WARNING {
+				log.Printf("[WARNING] URL inválida ignorada: %s", endpoint)
+			}
+			continue
+		}
+
+		resp, body, err := invokeGetRepeatedly(endpoint)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		result := models.ScanResult{
+			ScanID:    scanID,
+			URL:       endpoint,
+			Result:    string(body),
+			CreatedAt: time.Now(),
+		}
+
+		if err := SaveScanResult(db, scan, &result); err != nil {
+			return nil, err
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+func ContinueScan(db *sql.DB, scanID string, filename string) ([]models.ScanResult, error) {
+	lines, err := readLines(&filename)
+	if err != nil {
+		return nil, err
+	}
+
+	scan := &models.Scan{
+		Id: scanID,
+	}
+
+	var newResults []models.ScanResult
+
+	for _, endpoint := range lines {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			continue
+		}
+
+		if !validateURL(endpoint) {
+			continue
+		}
+
+		check := &models.ScanResult{
+			ScanID: scanID,
+			URL:    endpoint,
+		}
+
+		if HostExists(db, check) {
+			if logLevel >= LOG_DEBUG {
+				log.Printf("[DEBUG] URL ya escaneada, se omite: %s", endpoint)
+			}
+			continue
+		}
+
+		resp, body, err := invokeGetRepeatedly(endpoint)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		result := models.ScanResult{
+			ScanID:    scanID,
+			URL:       endpoint,
+			Result:    string(body),
+			CreatedAt: time.Now(),
+		}
+
+		if err := SaveScanResult(db, scan, &result); err != nil {
+			return nil, err
+		}
+
+		newResults = append(newResults, result)
+	}
+
+	return newResults, nil
+}
+
 func main() {
 	var conf_api = flag.String("api", "BUILTIN", "API entry point, for example https://www.example.com/api/")
 	var conf_grade = flag.Bool("grade", false, "Output only the hostname: grade")
